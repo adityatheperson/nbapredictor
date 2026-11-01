@@ -13,6 +13,7 @@ import numpy as np
 import pandas as pd
 
 from src.features_rolling import ROLL_COLS, WINDOWS
+from src.injuries import team_injuries, match_out_players, fetch_report
 
 EXPANSIVE = Path("data/processed/training_expansive.parquet")
 MODEL_FILE = Path("models/player_pts_lgbm.pkl")
@@ -20,6 +21,11 @@ MODEL_FILE = Path("models/player_pts_lgbm.pkl")
 BENCH_CORRECTION = 0.93  # top-10 scorers account for ~93% of team points
 DIFF_SIGMA = 13.5        # std of (total_A - total_B) for win prob
 N_SIMS = 10_000
+QUESTIONABLE_SCALE = 0.75  # expected-output discount for game-time decisions
+REDIST_SHARE = 0.35        # share of a scratched player's scoring absorbed by teammates
+# (teammates absorb most of the missing usage, but at worse efficiency, and the
+# promoted bench players were already counted in the 7% bench allowance, so the
+# net team impact of an absence is modestly negative — never positive, see cap)
 
 
 def _resolve_teams():
@@ -162,10 +168,31 @@ def load_model():
     return None, None, False
 
 
-def predict_matchup(team_a, team_b, home_team=None, game_date=None, rosters=None, hist=None, bios=None):
+def predict_matchup(team_a, team_b, home_team=None, game_date=None, rosters=None, hist=None, bios=None,
+                    injuries="auto", extra_out=None, questionable_scale=QUESTIONABLE_SCALE,
+                    redist_share=REDIST_SHARE):
+    """injuries: 'auto' (ESPN report), None (ignore), or {TEAM: [player names]} treated as OUT.
+    extra_out: {TEAM: [names]} merged on top (e.g. manual scratches from UI)."""
     team_a, team_b = team_a.upper(), team_b.upper()
     game_date = pd.to_datetime(game_date) if game_date else pd.Timestamp.now().normalize()
     home_team = (home_team or team_a).upper()
+    extra_out = extra_out or {}
+
+    # --- resolve injuries ---
+    auto_out, auto_q = {}, {}
+    if injuries == "auto":
+        try:
+            report = fetch_report()
+            for t in (team_a, team_b):
+                injs = team_injuries(t, report)
+                auto_out[t] = [i["player"] for i in injs if i["category"] == "out"]
+                auto_q[t] = [i["player"] for i in injs if i["category"] == "questionable"]
+        except Exception as e:
+            print(f"Injury feed unavailable ({e}); proceeding without it.")
+    elif isinstance(injuries, dict):
+        for t in (team_a, team_b):
+            auto_out[t] = list(injuries.get(t, []))
+            auto_q[t] = []
 
     if hist is None:
         hist = pd.read_parquet(EXPANSIVE) if EXPANSIVE.exists() else None
@@ -209,10 +236,24 @@ def predict_matchup(team_a, team_b, home_team=None, game_date=None, rosters=None
             preds.append({"player": pname, "player_id": pid, "pred_pts": pts,
                           "sigma": sigma, "base_avg10": base_avg})
         pdf = pd.DataFrame(preds).sort_values("pred_pts", ascending=False).reset_index(drop=True)
-        # team total: top-10 scaled (rotation players), bench correction
-        top10 = pdf.head(10)["pred_pts"].sum()
-        total = top10 / BENCH_CORRECTION
-        results[team] = {"players": pdf, "total": float(total), "is_home": is_home}
+        # --- apply injuries: scratch OUTs, discount QUESTIONABLEs, redistribute ---
+        roster_names = pdf["player"].tolist()
+        out_names = match_out_players(roster_names,
+                                      list(auto_out.get(team, [])) + list(extra_out.get(team, [])))
+        q_names = match_out_players(roster_names, list(auto_q.get(team, []))) - out_names
+        pdf["status"] = "OK"
+        pdf.loc[pdf["player"].isin(out_names), "status"] = "OUT"
+        pdf.loc[pdf["player"].isin(q_names), "status"] = "Q"
+        no_injury_total = pdf["pred_pts"].head(10).sum() / BENCH_CORRECTION
+        pdf.loc[pdf["status"] == "Q", "pred_pts"] *= questionable_scale
+        removed_pts = float(pdf.loc[pdf["status"] == "OUT", "pred_pts"].sum())
+        avail = pdf[pdf["status"] != "OUT"].sort_values("pred_pts", ascending=False)
+        top10 = avail.head(10)["pred_pts"].sum()
+        total = top10 / BENCH_CORRECTION + redist_share * removed_pts
+        total = min(total, no_injury_total)  # absences can't improve a team
+        results[team] = {"players": pdf, "total": float(total), "is_home": is_home,
+                         "out": sorted(out_names), "questionable": sorted(q_names),
+                         "removed_pts": removed_pts}
 
     ta, tb = results[team_a]["total"], results[team_b]["total"]
     diff = ta - tb
@@ -221,11 +262,12 @@ def predict_matchup(team_a, team_b, home_team=None, game_date=None, rosters=None
     rng = np.random.default_rng(42)
     sim_a, sim_b = np.zeros(N_SIMS), np.zeros(N_SIMS)
     for team, arr in [(team_a, sim_a), (team_b, sim_b)]:
-        pdf = results[team]["players"].head(10)
+        pdf = results[team]["players"]
+        avail = pdf[pdf["status"] != "OUT"].sort_values("pred_pts", ascending=False).head(10)
         sims = np.zeros(N_SIMS)
-        for _, pr in pdf.iterrows():
+        for _, pr in avail.iterrows():
             sims += np.maximum(0, rng.normal(pr["pred_pts"], pr["sigma"], N_SIMS))
-        arr[:] = sims / BENCH_CORRECTION
+        arr[:] = sims / BENCH_CORRECTION + redist_share * results[team]["removed_pts"]
     p_a_mc = float((sim_a > sim_b).mean())
     winner = team_a if p_a_mc >= 0.5 else team_b
     return {
@@ -238,6 +280,8 @@ def predict_matchup(team_a, team_b, home_team=None, game_date=None, rosters=None
         "winner": winner,
         "sim_totals": {team_a: sim_a, team_b: sim_b},
         "players": {team_a: results[team_a]["players"], team_b: results[team_b]["players"]},
+        "out": {team_a: results[team_a]["out"], team_b: results[team_b]["out"]},
+        "questionable": {team_a: results[team_a]["questionable"], team_b: results[team_b]["questionable"]},
         "used_model": has_model,
     }
 
@@ -253,6 +297,11 @@ def main():
     print(f"{out['team_a']} {out['totals'][out['team_a']]} vs {out['team_b']} {out['totals'][out['team_b']]} "
           f"on {out['date']} (home: {out['home_team']}) [{'MODEL' if out['used_model'] else 'BASELINE'}]")
     print(f"Winner: {out['winner']}  P({out['team_a']})={out['win_prob'][out['team_a']]}  spread={out['spread']}")
+    for t in [out["team_a"], out["team_b"]]:
+        if out["out"][t]:
+            print(f"  {t} OUT: {', '.join(out['out'][t])}")
+        if out["questionable"][t]:
+            print(f"  {t} QUESTIONABLE: {', '.join(out['questionable'][t])}")
     for t in [out["team_a"], out["team_b"]]:
         print(f"\n--- {t} ---")
         print(out["players"][t].head(12).to_string(index=False))
