@@ -1,0 +1,262 @@
+"""Inference: given 2 NBA teams, predict each player's PTS, team totals, winner.
+Usage:
+  python3 -m src.predict LAL BOS --home LAL
+Works with trained model (models/player_pts_lgbm.pkl) or baseline fallback (PTS_AVG10).
+"""
+import argparse
+import math
+import pickle
+from datetime import datetime
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+from src.features_rolling import ROLL_COLS, WINDOWS
+
+EXPANSIVE = Path("data/processed/training_expansive.parquet")
+MODEL_FILE = Path("models/player_pts_lgbm.pkl")
+
+BENCH_CORRECTION = 0.93  # top-10 scorers account for ~93% of team points
+DIFF_SIGMA = 13.5        # std of (total_A - total_B) for win prob
+N_SIMS = 10_000
+
+
+def _resolve_teams():
+    from nba_api.stats.static import teams as static_teams
+    return {t["abbreviation"]: t for t in static_teams.get_teams()}
+
+
+def get_roster(team_abbrev):
+    """Live roster via CommonTeamRoster. Returns DataFrame with PLAYER_ID, PLAYER."""
+    from nba_api.stats.static import teams as static_teams
+    from nba_api.stats.endpoints import CommonTeamRoster
+    all_teams = static_teams.get_teams()
+    match = [t for t in all_teams if t["abbreviation"] == team_abbrev.upper()]
+    if not match:
+        raise ValueError(f"Unknown team abbrev: {team_abbrev}")
+    tid = match[0]["id"]
+    roster = CommonTeamRoster(team_id=tid, timeout=30).get_data_frames()[0]
+    return roster
+
+
+def _player_history(player_id, hist):
+    if hist is None or len(hist) == 0:
+        return None
+    g = hist[hist["PLAYER_ID"] == player_id].sort_values("GAME_DATE")
+    return g if len(g) else None
+
+
+def build_feature_row(player_id, player_name, opp_abbrev, is_home, game_date, hist, bios, feature_names):
+    """Build one model-ready row from history (no leakage: only past games)."""
+    g = _player_history(player_id, hist) if hist is not None else None
+    row = {}
+    if g is not None and len(g) >= 1:
+        last = g.iloc[-1]
+        for w in WINDOWS:
+            window = g.tail(w)
+            for c in ROLL_COLS:
+                vals = window[c].dropna() if c in window.columns else pd.Series([], dtype=float)
+                row[f"{c}_AVG{w}"] = float(vals.mean()) if len(vals) else np.nan
+                row[f"{c}_STD{w}"] = float(vals.std()) if len(vals) > 1 else 0.0
+            row[f"GP_LAST{w}"] = int(min(len(window), w))
+        for c in ["PTS", "MIN_NUM", "REB", "AST"]:
+            row[f"{c}_CAREER_AVG"] = float(g[c].mean()) if c in g.columns else np.nan
+        row["CAREER_GP"] = int(len(g))
+        row["PTS_L1_vs_AVG10"] = float(g["PTS"].iloc[-1] - row.get("PTS_AVG10", np.nan))
+        # context from last game + new matchup
+        row["REST_DAYS"] = 2
+        row["BACK_TO_BACK"] = 0
+        row["GAMES_LAST_7D"] = int((g.tail(5).shape[0] > 3))
+        # bio
+        if bios is not None and player_id in bios.index:
+            b = bios.loc[player_id]
+            try:
+                bdate = pd.to_datetime(b.get("BIRTHDATE"))
+                row["AGE_AT_GAME"] = (pd.to_datetime(game_date) - bdate).days / 365.25
+            except Exception:
+                row["AGE_AT_GAME"] = 27.0
+            row["HEIGHT_IN"] = _height_to_in(b.get("HEIGHT"))
+            row["WEIGHT_NUM"] = _to_num(b.get("WEIGHT"), 220)
+            row["DRAFT_NUMBER_NUM"] = _to_num(b.get("DRAFT_NUMBER"), 61)
+            row["IS_UNDRAFTED"] = int(row["DRAFT_NUMBER_NUM"] == 61)
+            row["SEASON_EXP_AT_FETCH"] = _to_num(b.get("SEASON_EXP"), 3)
+        else:
+            row["AGE_AT_GAME"] = 27.0
+            row["HEIGHT_IN"] = np.nan
+            row["WEIGHT_NUM"] = 220.0
+            row["DRAFT_NUMBER_NUM"] = 61.0
+            row["IS_UNDRAFTED"] = 1
+            row["SEASON_EXP_AT_FETCH"] = 3.0
+        # last-game derived flags baseline
+        row["MIN_NUM"] = row.get("MIN_NUM_AVG5", 20.0)
+    else:
+        # Rookie / unknown: league-average priors
+        for w in WINDOWS:
+            for c in ROLL_COLS:
+                row[f"{c}_AVG{w}"] = np.nan
+                row[f"{c}_STD{w}"] = 0.0
+            row[f"GP_LAST{w}"] = 0
+        for c in ["PTS", "MIN_NUM", "REB", "AST"]:
+            row[f"{c}_CAREER_AVG"] = np.nan
+        row["CAREER_GP"] = 0
+        row["PTS_L1_vs_AVG10"] = 0.0
+        row["REST_DAYS"] = 2
+        row["BACK_TO_BACK"] = 0
+        row["GAMES_LAST_7D"] = 0
+        row["AGE_AT_GAME"] = 22.0
+        row["HEIGHT_IN"] = np.nan
+        row["WEIGHT_NUM"] = 220.0
+        row["DRAFT_NUMBER_NUM"] = 30.0
+        row["IS_UNDRAFTED"] = 0
+        row["SEASON_EXP_AT_FETCH"] = 0.0
+        row["MIN_NUM"] = 15.0
+
+    row["AGE_SQ"] = row["AGE_AT_GAME"] ** 2
+    row["PTS_AVG10_x_AGE"] = (row.get("PTS_AVG10") or 0) * row["AGE_AT_GAME"]
+    row["IS_HOME"] = int(is_home)
+    row["GAME_MONTH"] = game_date.month
+    row["GAME_WEEKDAY"] = game_date.weekday()
+    row["SEASON_YEAR"] = game_date.year
+    row["DOUBLE_DOUBLE"] = 0
+    row["PTS_30"] = 0
+    row["PTS_20"] = 0
+    row["DID_NOT_PLAY"] = 0
+    # derived per-min priors
+    for c in ["EFG_PCT", "TS_PCT", "PTS_PER_MIN", "REB_PER_MIN", "AST_PER_MIN", "AST_TOV"]:
+        row.setdefault(c, 0.0)
+    for c in ["FGM", "FGA", "FG_PCT", "FG3M", "FG3A", "FG3_PCT", "FTM", "FTA", "FT_PCT",
+              "OREB", "DREB", "REB", "AST", "STL", "BLK", "TOV", "PF", "PLUS_MINUS", "FANTASY_PTS"]:
+        row.setdefault(c, row.get(f"{c}_AVG10", 0.0) or 0.0)
+    # order to model features
+    return pd.Series({f: row.get(f, np.nan) for f in feature_names})
+
+
+def _height_to_in(h):
+    import re
+    if h is None or (isinstance(h, float) and np.isnan(h)):
+        return np.nan
+    m = re.match(r"(\d+)-(\d+)", str(h))
+    if m:
+        return int(m.group(1)) * 12 + int(m.group(2))
+    try:
+        return float(h)
+    except Exception:
+        return np.nan
+
+
+def _to_num(v, default):
+    try:
+        if v is None or (isinstance(v, float) and np.isnan(v)) or v == "":
+            return default
+        return float(v)
+    except Exception:
+        return default
+
+
+def load_model():
+    if MODEL_FILE.exists():
+        with open(MODEL_FILE, "rb") as f:
+            bundle = pickle.load(f)
+        return bundle["model"], bundle["features"], True
+    return None, None, False
+
+
+def predict_matchup(team_a, team_b, home_team=None, game_date=None, rosters=None, hist=None, bios=None):
+    team_a, team_b = team_a.upper(), team_b.upper()
+    game_date = pd.to_datetime(game_date) if game_date else pd.Timestamp.now().normalize()
+    home_team = (home_team or team_a).upper()
+
+    if hist is None:
+        hist = pd.read_parquet(EXPANSIVE) if EXPANSIVE.exists() else None
+        if hist is not None:
+            hist["GAME_DATE"] = pd.to_datetime(hist["GAME_DATE"])
+    if bios is None:
+        from src.config import BIOS_FILE
+        if BIOS_FILE.exists():
+            b = pd.read_parquet(BIOS_FILE).drop_duplicates("PERSON_ID")
+            bios = b.set_index("PERSON_ID")
+
+    if rosters is None:
+        rosters = {team_a: get_roster(team_a), team_b: get_roster(team_b)}
+
+    model, features, has_model = load_model()
+
+    results = {}
+    for team, opp in [(team_a, team_b), (team_b, team_a)]:
+        ros = rosters[team]
+        # normalize roster columns across API versions
+        id_col = "PLAYER_ID" if "PLAYER_ID" in ros.columns else "PERSON_ID"
+        name_col = "PLAYER" if "PLAYER" in ros.columns else "DISPLAY_FIRST_LAST"
+        is_home = int(team == home_team)
+        preds = []
+        for _, r in ros.iterrows():
+            pid = int(r[id_col])
+            pname = str(r[name_col])
+            if has_model:
+                x = build_feature_row(pid, pname, opp, is_home, game_date, hist, bios, features)
+                X = pd.DataFrame([x]).fillna(-1)
+                pts = float(max(0.0, model.predict(X)[0]))
+                sigma = float(x.get("PTS_STD10", 5.0) or 5.0)
+                sigma = min(max(sigma, 4.0), 12.0)
+                base_avg = float(x.get("PTS_AVG10", pts) or pts)
+            else:
+                g = _player_history(pid, hist) if hist is not None else None
+                pts = float(g.tail(10)["PTS"].mean()) if g is not None and len(g) else 8.0
+                sigma = float(g.tail(10)["PTS"].std()) if g is not None and len(g) > 1 else 6.0
+                sigma = min(max(sigma or 6.0, 4.0), 12.0)
+                base_avg = pts
+            preds.append({"player": pname, "player_id": pid, "pred_pts": pts,
+                          "sigma": sigma, "base_avg10": base_avg})
+        pdf = pd.DataFrame(preds).sort_values("pred_pts", ascending=False).reset_index(drop=True)
+        # team total: top-10 scaled (rotation players), bench correction
+        top10 = pdf.head(10)["pred_pts"].sum()
+        total = top10 / BENCH_CORRECTION
+        results[team] = {"players": pdf, "total": float(total), "is_home": is_home}
+
+    ta, tb = results[team_a]["total"], results[team_b]["total"]
+    diff = ta - tb
+    # analytic win prob (normal diff) + Monte Carlo with player variance
+    p_a_analytic = 0.5 * (1 + math.erf(diff / (DIFF_SIGMA * math.sqrt(2))))
+    rng = np.random.default_rng(42)
+    sim_a, sim_b = np.zeros(N_SIMS), np.zeros(N_SIMS)
+    for team, arr in [(team_a, sim_a), (team_b, sim_b)]:
+        pdf = results[team]["players"].head(10)
+        sims = np.zeros(N_SIMS)
+        for _, pr in pdf.iterrows():
+            sims += np.maximum(0, rng.normal(pr["pred_pts"], pr["sigma"], N_SIMS))
+        arr[:] = sims / BENCH_CORRECTION
+    p_a_mc = float((sim_a > sim_b).mean())
+    winner = team_a if p_a_mc >= 0.5 else team_b
+    return {
+        "team_a": team_a, "team_b": team_b, "home_team": home_team,
+        "date": str(game_date.date()),
+        "totals": {team_a: round(ta, 1), team_b: round(tb, 1)},
+        "win_prob": {team_a: round(p_a_mc, 3), team_b: round(1 - p_a_mc, 3)},
+        "win_prob_analytic": {team_a: round(p_a_analytic, 3), team_b: round(1 - p_a_analytic, 3)},
+        "spread": round(diff, 1),
+        "winner": winner,
+        "sim_totals": {team_a: sim_a, team_b: sim_b},
+        "players": {team_a: results[team_a]["players"], team_b: results[team_b]["players"]},
+        "used_model": has_model,
+    }
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("team_a")
+    ap.add_argument("team_b")
+    ap.add_argument("--home", default=None)
+    ap.add_argument("--date", default=None)
+    args = ap.parse_args()
+    out = predict_matchup(args.team_a, args.team_b, home_team=args.home, game_date=args.date)
+    print(f"{out['team_a']} {out['totals'][out['team_a']]} vs {out['team_b']} {out['totals'][out['team_b']]} "
+          f"on {out['date']} (home: {out['home_team']}) [{'MODEL' if out['used_model'] else 'BASELINE'}]")
+    print(f"Winner: {out['winner']}  P({out['team_a']})={out['win_prob'][out['team_a']]}  spread={out['spread']}")
+    for t in [out["team_a"], out["team_b"]]:
+        print(f"\n--- {t} ---")
+        print(out["players"][t].head(12).to_string(index=False))
+
+
+if __name__ == "__main__":
+    main()
