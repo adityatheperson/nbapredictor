@@ -12,7 +12,9 @@ from src.predict import predict_matchup
 from src.progress import get_stages
 from src.today import predict_all_games, summary_table, get_todays_games
 from src.grade import grade as grade_slate
-from src.config import TRAINING_FILE
+from src.config import APP_DIR
+
+LOCAL = Path("data/raw/player_game_logs_all.parquet").exists()
 
 st.set_page_config(page_title="NBA Predictor", page_icon="🏀", layout="wide")
 
@@ -166,7 +168,7 @@ def injury_text(p):
 @st.cache_data(ttl=300)
 def data_through():
     try:
-        d = pd.read_parquet(TRAINING_FILE, columns=["GAME_DATE"])["GAME_DATE"].max()
+        d = pd.read_parquet(APP_DIR / "player_recent.parquet", columns=["GAME_DATE"])["GAME_DATE"].max()
         return pd.to_datetime(d).strftime("%b %d, %Y")
     except Exception:
         return "unknown"
@@ -413,26 +415,31 @@ with tab_model:
     m2.metric("Games trained on", f"{m.get('n_train', 0):,}")
     m3.metric("Last trained", str(m.get("trained_at", "—")).replace("T", " "))
 
-    st.write("")
-    section("Update the model", "Pulls the latest games, rebuilds features, and retrains. Takes about 10 minutes. "
-                                "A daily job runs this at 6am.")
-    if st.button("Pull latest games and retrain"):
-        root = Path(".").resolve()
-        subprocess.Popen(["nohup", "bash", str(root / "src/daily_update.sh")],
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-        st.success("Update started. Watch the status at the top of the page.")
+    if LOCAL:
+        st.write("")
+        section("Update the model", "Pulls the latest games, rebuilds features, and retrains. Takes about 10 minutes. "
+                                    "A daily job runs this at 6am.")
+        if st.button("Pull latest games and retrain"):
+            root = Path(".").resolve()
+            subprocess.Popen(["nohup", "bash", str(root / "src/daily_update.sh")],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            st.success("Update started. Watch the status at the top of the page.")
 
-    st.write("")
-    section("Pipeline status")
+        st.write("")
+        section("Pipeline status")
 
-    @st.fragment(run_every=15)
-    def pipeline():
-        for label, frac, detail in get_stages():
-            c1, c2 = st.columns([3, 1])
-            c1.progress(min(max(frac, 0.0), 1.0), text=label)
-            c2.caption(detail)
+        @st.fragment(run_every=15)
+        def pipeline():
+            for label, frac, detail in get_stages():
+                c1, c2 = st.columns([3, 1])
+                c1.progress(min(max(frac, 0.0), 1.0), text=label)
+                c2.caption(detail)
 
-    pipeline()
+        pipeline()
+    else:
+        st.write("")
+        st.caption("This hosted copy is refreshed when the repository is updated. Retraining runs on the "
+                   "maintainer's machine.")
 
     st.write("")
     with st.expander("How the predictions work"):

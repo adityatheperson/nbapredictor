@@ -15,7 +15,7 @@ import pandas as pd
 from src.features_rolling import ROLL_COLS, WINDOWS
 from src.injuries import team_injuries, match_out_players, fetch_report
 
-EXPANSIVE = Path("data/processed/training_expansive.parquet")
+APP_DIR = Path("data/app")
 MODEL_FILE = Path("models/player_pts_lgbm.pkl")
 
 BENCH_CORRECTION = 0.93  # top-10 scorers account for ~93% of team points
@@ -53,8 +53,19 @@ def _player_history(player_id, hist):
     return g if len(g) else None
 
 
-def build_feature_row(player_id, player_name, opp_abbrev, is_home, game_date, hist, bios, feature_names):
-    """Build one model-ready row from history (no leakage: only past games)."""
+def load_snapshot():
+    """Runtime history from data/app/ (built by src.snapshot). Returns (recent, career, bios)."""
+    recent = pd.read_parquet(APP_DIR / "player_recent.parquet")
+    recent["GAME_DATE"] = pd.to_datetime(recent["GAME_DATE"])
+    career = pd.read_parquet(APP_DIR / "player_career.parquet").set_index("PLAYER_ID")
+    bios = pd.read_parquet(APP_DIR / "player_bios.parquet").drop_duplicates("PERSON_ID").set_index("PERSON_ID")
+    return recent, career, bios
+
+
+def build_feature_row(player_id, player_name, opp_abbrev, is_home, game_date, hist, bios, feature_names,
+                      career=None):
+    """Build one model-ready row from history (no leakage: only past games).
+    hist holds each player's most recent games; career holds full-history averages."""
     g = _player_history(player_id, hist) if hist is not None else None
     row = {}
     if g is not None and len(g) >= 1:
@@ -66,9 +77,13 @@ def build_feature_row(player_id, player_name, opp_abbrev, is_home, game_date, hi
                 row[f"{c}_AVG{w}"] = float(vals.mean()) if len(vals) else np.nan
                 row[f"{c}_STD{w}"] = float(vals.std()) if len(vals) > 1 else 0.0
             row[f"GP_LAST{w}"] = int(min(len(window), w))
+        cr = career.loc[player_id] if career is not None and player_id in career.index else None
         for c in ["PTS", "MIN_NUM", "REB", "AST"]:
-            row[f"{c}_CAREER_AVG"] = float(g[c].mean()) if c in g.columns else np.nan
-        row["CAREER_GP"] = int(len(g))
+            if cr is not None:
+                row[f"{c}_CAREER_AVG"] = float(cr[f"{c}_CAREER_AVG"])
+            else:
+                row[f"{c}_CAREER_AVG"] = float(g[c].mean()) if c in g.columns else np.nan
+        row["CAREER_GP"] = int(cr["CAREER_GP"]) if cr is not None else int(len(g))
         row["PTS_L1_vs_AVG10"] = float(g["PTS"].iloc[-1] - row.get("PTS_AVG10", np.nan))
         # context from last game + new matchup
         row["REST_DAYS"] = 2
@@ -168,7 +183,7 @@ def load_model():
     return None, None, False
 
 
-def predict_matchup(team_a, team_b, home_team=None, game_date=None, rosters=None, hist=None, bios=None,
+def predict_matchup(team_a, team_b, home_team=None, game_date=None, rosters=None, hist=None, bios=None, career=None,
                     injuries="auto", extra_out=None, questionable_scale=QUESTIONABLE_SCALE,
                     redist_share=REDIST_SHARE):
     """injuries: 'auto' (ESPN report), None (ignore), or {TEAM: [player names]} treated as OUT.
@@ -194,15 +209,11 @@ def predict_matchup(team_a, team_b, home_team=None, game_date=None, rosters=None
             auto_out[t] = list(injuries.get(t, []))
             auto_q[t] = []
 
-    if hist is None:
-        hist = pd.read_parquet(EXPANSIVE) if EXPANSIVE.exists() else None
-        if hist is not None:
-            hist["GAME_DATE"] = pd.to_datetime(hist["GAME_DATE"])
-    if bios is None:
-        from src.config import BIOS_FILE
-        if BIOS_FILE.exists():
-            b = pd.read_parquet(BIOS_FILE).drop_duplicates("PERSON_ID")
-            bios = b.set_index("PERSON_ID")
+    if hist is None or career is None or bios is None:
+        snap_hist, snap_career, snap_bios = load_snapshot()
+        hist = snap_hist if hist is None else hist
+        career = snap_career if career is None else career
+        bios = snap_bios if bios is None else bios
 
     if rosters is None:
         rosters = {team_a: get_roster(team_a), team_b: get_roster(team_b)}
@@ -221,7 +232,7 @@ def predict_matchup(team_a, team_b, home_team=None, game_date=None, rosters=None
             pid = int(r[id_col])
             pname = str(r[name_col])
             if has_model:
-                x = build_feature_row(pid, pname, opp, is_home, game_date, hist, bios, features)
+                x = build_feature_row(pid, pname, opp, is_home, game_date, hist, bios, features, career)
                 X = pd.DataFrame([x]).fillna(-1)
                 pts = float(max(0.0, model.predict(X)[0]))
                 sigma = float(x.get("PTS_STD10", 5.0) or 5.0)

@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
-data/
+data/*
+!data/app/
 .ipynb_checkpoints/
 venv/
 .venv/
