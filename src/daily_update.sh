@@ -14,6 +14,7 @@ $PY -W ignore -m src.update_daily >> "$LOG" 2>&1 \
 && $PY -W ignore -m src.build_dataset >> "$LOG" 2>&1 \
 && $PY -W ignore -m src.features_rolling >> "$LOG" 2>&1 \
 && $PY -W ignore -m src.train >> "$LOG" 2>&1 \
+&& $PY -W ignore -m src.team_model --elo >> "$LOG" 2>&1 \
 && $PY -W ignore -m src.snapshot >> "$LOG" 2>&1 \
 && echo "{\"state\": \"done\", \"at\": \"$(date -u +%FT%TZ)\"}" > "$STATUS" \
 || echo "{\"state\": \"failed\", \"at\": \"$(date -u +%FT%TZ)\"}" > "$STATUS"
