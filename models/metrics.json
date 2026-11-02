@@ -4,5 +4,6 @@
   "n_test": 195811,
   "cutoff": "2019-03-24",
   "n_features": 194,
-  "trained_at": "2026-11-01T16:14:38"
+  "trained_at": "2026-11-02T10:44:55",
+  "team_total_mae": 9.516
 }
