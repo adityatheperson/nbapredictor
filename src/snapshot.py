@@ -17,7 +17,7 @@ CAREER_COLS = ["PTS", "MIN_NUM", "REB", "AST"]
 
 def main():
     APP_DIR.mkdir(parents=True, exist_ok=True)
-    cols = sorted(set(["PLAYER_ID", "GAME_DATE"] + ROLL_COLS + CAREER_COLS))
+    cols = sorted(set(["PLAYER_ID", "PLAYER_NAME", "TEAM_ABBREVIATION", "GAME_DATE"] + ROLL_COLS + CAREER_COLS))
     df = pd.read_parquet(SRC, columns=cols)
     df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"])
     df = df.sort_values(["PLAYER_ID", "GAME_DATE"])

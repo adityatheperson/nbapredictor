@@ -14,7 +14,8 @@ NBA game predictor. Given two teams, it predicts each player's points, both team
 - `src/build_dataset.py`: merges logs and bios into `data/processed/training_expansive.parquet`.
 - `src/features_rolling.py`: rolling and career features into `training_model_ready.parquet`.
 - `src/train.py`: LightGBM player-points model. Writes `models/player_pts_lgbm.pkl`, `feature_importance.csv`, `metrics.json`.
-- `src/predict.py`: `predict_matchup(team_a, team_b, ...)`. Live rosters, injury adjustments, Monte Carlo win probability.
+- `src/predict.py`: `predict_matchup(team_a, team_b, ...)`. Live rosters, injury adjustments, Monte Carlo win probability. At runtime it reads only `data/app/` (snapshot) plus ESPN feeds — no stats.nba.com dependency except the live-roster fallback.
+- `src/snapshot.py`: builds `data/app/` (recent games, career averages, bios). Rerun after `build_dataset`; committed to git.
 - `src/injuries.py`: ESPN league injury report (cached 6h), fuzzy name matching.
 - `src/today.py`: today's games, ESPN live scores (cached 60s), slate prediction, saves slates to `data/processed/slates/`.
 - `src/grade.py`: compares saved slates against actual box scores.

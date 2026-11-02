@@ -1,10 +1,16 @@
-"""Grade saved slate predictions against actual box scores.
+"""Grade saved slate predictions against actual results.
+Tries NBA box scores first (full player-level grading); falls back to ESPN final
+scores (team-level only) when stats.nba.com is unreachable, e.g. on hosted servers.
 Usage: python3 -m src.grade [--date YYYY-MM-DD]  (default: today)
 """
 import argparse
+import re
 import pandas as pd
+from nba_api.stats.static import teams as static_teams
 from nba_api.stats.endpoints import LeagueGameLog
-from src.today import load_slate, ID_TO_ABBREV
+from src.today import load_slate, fetch_espn_events, nba_abbrev
+
+ID_TO_ABBREV = {t["id"]: t["abbreviation"] for t in static_teams.get_teams()}
 
 
 def season_for(date):
@@ -14,45 +20,65 @@ def season_for(date):
     return f"{d.year - 1}-{str(d.year)[-2:]}"
 
 
+def parse_matchup(m):
+    """'LAL @ BOS' -> ('LAL','BOS'); 'BOS vs. LAL' -> ('LAL','BOS')."""
+    m = str(m)
+    at = re.match(r"([A-Z]{2,3})\s*@\s*([A-Z]{2,3})", m)
+    if at:
+        return at.group(1), at.group(2)
+    vs = re.match(r"([A-Z]{2,3})\s*vs\.\s*([A-Z]{2,3})", m)
+    if vs:
+        return vs.group(2), vs.group(1)
+    return None, None
+
+
 def actuals_for_date(date):
-    """Returns (team_actuals, player_actuals) for one day.
+    """Returns (team_actuals, player_actuals, pair_to_gid) for one day.
     team_actuals: {(game_id, abbrev): pts}; player_actuals: {(game_id, player_id): (name, pts, min)}"""
     date = pd.to_datetime(date)
     dstr = date.strftime("%m/%d/%Y")
     season = season_for(date)
-    kwargs = dict(season=season, season_type_all_star="Regular Season",
-                  date_from_nullable=dstr, date_to_nullable=dstr, timeout=60)
-    tlog = LeagueGameLog(player_or_team_abbreviation="T", **kwargs).get_data_frames()[0]
-    plog = LeagueGameLog(player_or_team_abbreviation="P", **kwargs).get_data_frames()[0]
-    team, players = {}, {}
-    for _, r in tlog.iterrows():
-        try:
-            team[(str(r["GAME_ID"]), ID_TO_ABBREV[int(r["TEAM_ID"])])] = float(r["PTS"])
-        except KeyError:
-            continue
-    for _, r in plog.iterrows():
-        players[(str(r["GAME_ID"]), int(r["PLAYER_ID"]))] = (
-            str(r["PLAYER_NAME"]), float(r["PTS"]), str(r.get("MIN", "")))
-    # playoffs that same day
-    try:
-        kwargs["season_type_all_star"] = "Playoffs"
-        tlog2 = LeagueGameLog(player_or_team_abbreviation="T", **kwargs).get_data_frames()[0]
-        plog2 = LeagueGameLog(player_or_team_abbreviation="P", **kwargs).get_data_frames()[0]
-        for _, r in tlog2.iterrows():
+    team, players, pair_to_gid = {}, {}, {}
+
+    def ingest(season_type):
+        kwargs = dict(season=season, season_type_all_star=season_type,
+                      date_from_nullable=dstr, date_to_nullable=dstr, timeout=60)
+        tlog = LeagueGameLog(player_or_team_abbreviation="T", **kwargs).get_data_frames()[0]
+        plog = LeagueGameLog(player_or_team_abbreviation="P", **kwargs).get_data_frames()[0]
+        for _, r in tlog.iterrows():
             try:
                 team[(str(r["GAME_ID"]), ID_TO_ABBREV[int(r["TEAM_ID"])])] = float(r["PTS"])
+                a, h = parse_matchup(r.get("MATCHUP", ""))
+                if a and h:
+                    pair_to_gid[(a, h)] = str(r["GAME_ID"])
             except KeyError:
                 continue
-        for _, r in plog2.iterrows():
+        for _, r in plog.iterrows():
             players[(str(r["GAME_ID"]), int(r["PLAYER_ID"]))] = (
                 str(r["PLAYER_NAME"]), float(r["PTS"]), str(r.get("MIN", "")))
+
+    ingest("Regular Season")
+    try:
+        ingest("Playoffs")
     except Exception:
         pass
-    return team, players
+    return team, players, pair_to_gid
 
 
-def game_id_for(slate_game, team_actuals_keys=None):
-    return slate_game.get("game_id")
+def espn_finals(date):
+    """Fallback when NBA Stats is unreachable: {(away, home): (away_pts, home_pts)} for Final games."""
+    out = {}
+    for e in fetch_espn_events(date):
+        try:
+            if e["status"]["type"]["description"] != "Final":
+                continue
+            comp = e["competitions"][0]
+            abbrs = {c["homeAway"]: nba_abbrev(c["team"]["abbreviation"]) for c in comp["competitors"]}
+            scores = {c["homeAway"]: int(c.get("score", 0)) for c in comp["competitors"]}
+            out[(abbrs.get("away"), abbrs.get("home"))] = (scores.get("away"), scores.get("home"))
+        except (KeyError, IndexError, TypeError, ValueError):
+            continue
+    return out
 
 
 def grade(date=None):
@@ -61,12 +87,23 @@ def grade(date=None):
     slate = load_slate(date)
     if slate is None:
         return None
-    team_act, player_act = actuals_for_date(date)
+    note = None
+    try:
+        team_act, player_act, pair_to_gid = actuals_for_date(date)
+    except Exception:
+        team_act, player_act, pair_to_gid = {}, {}, {}
+        note = ("Box-score feed unreachable — graded on final scores only "
+                "(no player-level comparison).")
+    espn = espn_finals(date) if not team_act else {}
     game_rows, player_rows = [], []
     for g in slate["games"]:
-        gid, away, home = g.get("game_id"), g["away"], g["home"]
+        away, home = g["away"], g["home"]
+        gid = pair_to_gid.get((away, home)) or g.get("game_id")
         a_act = team_act.get((gid, away))
         h_act = team_act.get((gid, home))
+        if a_act is None and (away, home) in espn:
+            a_act, h_act = espn[(away, home)]
+            a_act, h_act = float(a_act), float(h_act)
         final = a_act is not None and h_act is not None
         actual_winner = (away if a_act is not None and h_act is not None and a_act > h_act
                          else home if final else None)
@@ -102,7 +139,7 @@ def grade(date=None):
         errs = pd.concat([finals.get("Away err"), finals.get("Home err")]).dropna()
         if len(errs):
             agg["team_total_mae"] = round(float(errs.mean()), 2)
-    return {"date": date, "games": games_df, "players": players_df, "agg": agg}
+    return {"date": date, "games": games_df, "players": players_df, "agg": agg, "note": note}
 
 
 def main():

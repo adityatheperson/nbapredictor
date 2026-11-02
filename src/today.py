@@ -4,37 +4,66 @@ Usage: python3 -m src.today [--date YYYY-MM-DD]
 import argparse
 import json
 import time
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
 import requests
-from nba_api.stats.static import teams as static_teams
-from nba_api.stats.endpoints import ScoreboardV2
 from src.predict import predict_matchup
 
 SLATE_DIR = Path("data/processed/slates")
 
-ID_TO_ABBREV = {t["id"]: t["abbreviation"] for t in static_teams.get_teams()}
 ESPN_SCOREBOARD = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard"
 SCORE_CACHE = Path("data/raw/live_scores.json")
 SCORE_TTL_SECONDS = 60
 
+# ESPN scoreboard abbreviations that differ from NBA Stats abbreviations
+ESPN_TO_NBA = {"NY": "NYK", "WSH": "WAS", "NO": "NOP", "UTAH": "UTA", "SA": "SAS", "GS": "GSW"}
 
-def fetch_live_scores(date=None):
-    """Live scoreboard keyed by (away, home): {state, clock, period, scores}.
-    Cached 60s to stay polite on UI reruns."""
+
+def nba_abbrev(abbr):
+    return ESPN_TO_NBA.get(abbr, abbr)
+
+
+def fetch_espn_events(date=None):
+    """Full ESPN scoreboard events for a day (schedule + live scores). Cached 60s."""
     date = pd.to_datetime(date).strftime("%Y%m%d") if date else pd.Timestamp.now().strftime("%Y%m%d")
     if SCORE_CACHE.exists() and (time.time() - SCORE_CACHE.stat().st_mtime) < SCORE_TTL_SECONDS:
         try:
             cached = json.loads(SCORE_CACHE.read_text())
             if cached.get("date") == date:
-                return cached["games"]
+                return cached["events"]
         except Exception:
             pass
-    games = {}
     try:
         events = requests.get(f"{ESPN_SCOREBOARD}?dates={date}", timeout=20).json().get("events", [])
-        for e in events:
+    except Exception as ex:
+        print(f"Scoreboard unavailable ({ex})")
+        return []
+    SCORE_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    SCORE_CACHE.write_text(json.dumps({"date": date, "events": events}))
+    return events
+
+
+def tip_text(event):
+    """Human tip time, e.g. '8:30 PM ET'. Prefers ESPN's own label."""
+    short = (event.get("status", {}).get("type", {}).get("shortDetail") or "").strip()
+    if short and "ET" in short:
+        return short
+    try:
+        from zoneinfo import ZoneInfo
+        dt = datetime.fromisoformat(event["date"].replace("Z", "+00:00"))
+        et = dt.astimezone(ZoneInfo("America/New_York"))
+        return et.strftime("%-I:%M %p ET")
+    except Exception:
+        return ""
+
+
+def fetch_live_scores(date=None):
+    """Live scoreboard keyed by (away, home): {state, clock, period, scores}."""
+    games = {}
+    for e in fetch_espn_events(date):
+        try:
             comp = e["competitions"][0]
             entry = {"state": e["status"]["type"]["description"],
                      "clock": e["status"].get("displayClock", ""),
@@ -45,38 +74,37 @@ def fetch_live_scores(date=None):
                     entry["scores"][c["homeAway"]] = int(c.get("score", 0))
                 except (TypeError, ValueError):
                     entry["scores"][c["homeAway"]] = 0
-            abbrs = {c["homeAway"]: c["team"]["abbreviation"] for c in comp["competitors"]}
+            abbrs = {c["homeAway"]: nba_abbrev(c["team"]["abbreviation"]) for c in comp["competitors"]}
             games[(abbrs.get("away"), abbrs.get("home"))] = entry
-        SCORE_CACHE.parent.mkdir(parents=True, exist_ok=True)
-        SCORE_CACHE.write_text(json.dumps({"date": date, "games": {f"{k[0]}@{k[1]}": v for k, v in games.items()}}))
-    except Exception as ex:
-        print(f"Live scores unavailable ({ex})")
+        except (KeyError, IndexError):
+            continue
     return games
 
 
 def get_todays_games(date=None):
-    sched_date = pd.to_datetime(date).strftime("%Y-%m-%d") if date else pd.Timestamp.now().strftime("%Y-%m-%d")
-    header = ScoreboardV2(game_date=sched_date, timeout=30).get_data_frames()[0]
     live = fetch_live_scores(date)
     games = []
-    for _, r in header.iterrows():
+    for e in fetch_espn_events(date):
         try:
-            away = ID_TO_ABBREV[int(r["VISITOR_TEAM_ID"])]
-            home = ID_TO_ABBREV[int(r["HOME_TEAM_ID"])]
+            comp = e["competitions"][0]
+            abbrs = {c["homeAway"]: nba_abbrev(c["team"]["abbreviation"]) for c in comp["competitors"]}
+            away, home = abbrs.get("away"), abbrs.get("home")
+            if not away or not home:
+                continue
             lv = live.get((away, home), {})
             games.append({
-                "game_id": str(r["GAME_ID"]),
+                "game_id": str(e.get("id", f"{away}@{home}")),
                 "home": home,
                 "away": away,
-                "status": str(r.get("GAME_STATUS_TEXT", "")),
-                "arena": str(r.get("ARENA_NAME", "")),
+                "status": tip_text(e),
+                "arena": comp.get("venue", {}).get("fullName", ""),
                 "live_state": lv.get("state", "Scheduled"),
                 "clock": lv.get("clock", ""),
                 "period": lv.get("period", 0),
                 "live_away": lv.get("scores", {}).get("away"),
                 "live_home": lv.get("scores", {}).get("home"),
             })
-        except KeyError:
+        except (KeyError, IndexError):
             continue
     return games
 

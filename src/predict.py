@@ -46,6 +46,33 @@ def get_roster(team_abbrev):
     return roster
 
 
+def get_snapshot_roster(team_abbrev, days=21):
+    """Roster from our own recent game logs (works anywhere, no NBA API).
+    Players whose latest game (within `days` of the newest data) was for `team_abbrev`."""
+    recent = pd.read_parquet(APP_DIR / "player_recent.parquet",
+                             columns=["PLAYER_ID", "PLAYER_NAME", "TEAM_ABBREVIATION", "GAME_DATE"])
+    recent["GAME_DATE"] = pd.to_datetime(recent["GAME_DATE"])
+    team_abbrev = team_abbrev.upper()
+    latest = recent.sort_values("GAME_DATE").drop_duplicates("PLAYER_ID", keep="last")
+    cutoff = recent["GAME_DATE"].max() - pd.Timedelta(days=days)
+    g = latest[(latest["TEAM_ABBREVIATION"] == team_abbrev) & (latest["GAME_DATE"] >= cutoff)]
+    return pd.DataFrame({"PLAYER_ID": g["PLAYER_ID"].values, "PLAYER": g["PLAYER_NAME"].values})
+
+
+def resolve_rosters(team_a, team_b):
+    """Snapshot rosters first (offline-safe); live NBA API only as fallback."""
+    rosters = {}
+    for t in (team_a, team_b):
+        try:
+            ros = get_snapshot_roster(t)
+            if len(ros) < 8:
+                raise ValueError(f"only {len(ros)} recent players")
+            rosters[t] = ros
+        except Exception:
+            rosters[t] = get_roster(t)
+    return rosters
+
+
 def _player_history(player_id, hist):
     if hist is None or len(hist) == 0:
         return None
@@ -216,7 +243,7 @@ def predict_matchup(team_a, team_b, home_team=None, game_date=None, rosters=None
         bios = snap_bios if bios is None else bios
 
     if rosters is None:
-        rosters = {team_a: get_roster(team_a), team_b: get_roster(team_b)}
+        rosters = resolve_rosters(team_a, team_b)
 
     model, features, has_model = load_model()
 
