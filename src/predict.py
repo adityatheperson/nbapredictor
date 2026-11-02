@@ -14,6 +14,7 @@ import pandas as pd
 
 from src.features_rolling import ROLL_COLS, WINDOWS
 from src.injuries import team_injuries, match_out_players, fetch_report
+from src.config import now
 
 APP_DIR = Path("data/app")
 MODEL_FILE = Path("models/player_pts_lgbm.pkl")
@@ -216,7 +217,7 @@ def predict_matchup(team_a, team_b, home_team=None, game_date=None, rosters=None
     """injuries: 'auto' (ESPN report), None (ignore), or {TEAM: [player names]} treated as OUT.
     extra_out: {TEAM: [names]} merged on top (e.g. manual scratches from UI)."""
     team_a, team_b = team_a.upper(), team_b.upper()
-    game_date = pd.to_datetime(game_date) if game_date else pd.Timestamp.now().normalize()
+    game_date = pd.to_datetime(game_date) if game_date else now().normalize()
     home_team = (home_team or team_a).upper()
     extra_out = extra_out or {}
 

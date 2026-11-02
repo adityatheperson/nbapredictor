@@ -48,8 +48,9 @@ def classify(status):
 
 
 def fetch_report(max_age_hours=CACHE_TTL_HOURS):
+    from src.config import now
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = now().strftime("%Y-%m-%d")
     cache = CACHE_DIR / f"injuries_{today}.json"
     if cache.exists() and (time.time() - cache.stat().st_mtime) < max_age_hours * 3600:
         return json.loads(cache.read_text())

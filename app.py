@@ -12,7 +12,7 @@ from src.predict import predict_matchup
 from src.progress import get_stages
 from src.today import predict_all_games, summary_table, get_todays_games
 from src.grade import grade as grade_slate
-from src.config import APP_DIR
+from src.config import APP_DIR, now
 
 LOCAL = Path("data/raw/player_game_logs_all.parquet").exists()
 
@@ -228,7 +228,7 @@ tab_today, tab_match, tab_results, tab_model = st.tabs(
 
 # ---------- Today ----------
 with tab_today:
-    section("Today's games", "Every game on today's schedule with the model's totals, pick, and injuries.")
+    section(f"Today's games — {now().strftime('%A, %b %d')}", "Every game on today's schedule with the model's totals, pick, and injuries.")
     if st.button("Predict today's slate", type="primary"):
         with st.status("Predicting every game…", expanded=True) as status:
             def cb(i, n, g):
@@ -379,7 +379,7 @@ with tab_results:
             "Saved slates are graded against final box scores. Pick a date to see how the model did.")
     r1, r2 = st.columns([2, 1])
     with r1:
-        grade_date = st.date_input("Game date", value=pd.Timestamp.now() - pd.Timedelta(days=1))
+        grade_date = st.date_input("Game date", value=(now() - pd.Timedelta(days=1)).date())
     with r2:
         st.write("")
         do_grade = st.button("Grade games", type="primary")
@@ -393,6 +393,8 @@ with tab_results:
         if res is None:
             st.info("No saved predictions for that date. Predict the slate on the same day and it saves automatically.")
         else:
+            if res.get("note"):
+                st.caption(res["note"])
             a = res["agg"]
             m1, m2, m3 = st.columns(3)
             m1.metric("Winner calls", a.get("winner_accuracy", "—"))

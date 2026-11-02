@@ -5,6 +5,16 @@ ROOT = Path(__file__).resolve().parent.parent
 DATA_RAW = ROOT / "data" / "raw"
 DATA_PROCESSED = ROOT / "data" / "processed"
 APP_DIR = ROOT / "data" / "app"  # small committed snapshot the hosted app reads
+
+# Display timezone for "today" everywhere (schedule, slate saving, grading).
+# Servers run UTC, which flips the date early in US evenings; the app follows PT.
+from zoneinfo import ZoneInfo
+import pandas as pd
+APP_TZ = ZoneInfo("America/Los_Angeles")
+
+
+def now():
+    return pd.Timestamp.now(tz=APP_TZ)
 DATA_RAW.mkdir(parents=True, exist_ok=True)
 DATA_PROCESSED.mkdir(parents=True, exist_ok=True)
 

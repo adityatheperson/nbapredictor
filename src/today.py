@@ -10,6 +10,7 @@ from pathlib import Path
 import pandas as pd
 import requests
 from src.predict import predict_matchup
+from src.config import now
 
 SLATE_DIR = Path("data/processed/slates")
 
@@ -27,7 +28,7 @@ def nba_abbrev(abbr):
 
 def fetch_espn_events(date=None):
     """Full ESPN scoreboard events for a day (schedule + live scores). Cached 60s."""
-    date = pd.to_datetime(date).strftime("%Y%m%d") if date else pd.Timestamp.now().strftime("%Y%m%d")
+    date = pd.to_datetime(date).strftime("%Y%m%d") if date else now().strftime("%Y%m%d")
     if SCORE_CACHE.exists() and (time.time() - SCORE_CACHE.stat().st_mtime) < SCORE_TTL_SECONDS:
         try:
             cached = json.loads(SCORE_CACHE.read_text())
@@ -126,7 +127,7 @@ def predict_all_games(date=None, progress_cb=None, save=True):
 
 
 def save_slate(date, results):
-    date = pd.to_datetime(date).strftime("%Y-%m-%d") if date else pd.Timestamp.now().strftime("%Y-%m-%d")
+    date = pd.to_datetime(date).strftime("%Y-%m-%d") if date else now().strftime("%Y-%m-%d")
     SLATE_DIR.mkdir(parents=True, exist_ok=True)
     data = {"date": date, "games": []}
     for r in results:

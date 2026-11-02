@@ -9,6 +9,7 @@ import pandas as pd
 from nba_api.stats.static import teams as static_teams
 from nba_api.stats.endpoints import LeagueGameLog
 from src.today import load_slate, fetch_espn_events, nba_abbrev
+from src.config import now
 
 ID_TO_ABBREV = {t["id"]: t["abbreviation"] for t in static_teams.get_teams()}
 
@@ -83,7 +84,7 @@ def espn_finals(date):
 
 def grade(date=None):
     """Returns dict with game_rows, player_rows, aggregates. None if no saved slate."""
-    date = pd.to_datetime(date).strftime("%Y-%m-%d") if date else pd.Timestamp.now().strftime("%Y-%m-%d")
+    date = pd.to_datetime(date).strftime("%Y-%m-%d") if date else now().strftime("%Y-%m-%d")
     slate = load_slate(date)
     if slate is None:
         return None
