@@ -193,6 +193,22 @@ def game_clock(g):
     return f"({g.get('live_state', '')} {q} {g.get('clock', '')})".strip()
 
 
+def espn_finals(date):
+    """{(away, home): (away_pts, home_pts)} for Final games. Works for past dates."""
+    out = {}
+    for e in fetch_espn_events(date):
+        try:
+            if e["status"]["type"]["description"] != "Final":
+                continue
+            comp = e["competitions"][0]
+            abbrs = {c["homeAway"]: nba_abbrev(c["team"]["abbreviation"]) for c in comp["competitors"]}
+            scores = {c["homeAway"]: int(c.get("score", 0)) for c in comp["competitors"]}
+            out[(abbrs.get("away"), abbrs.get("home"))] = (scores.get("away"), scores.get("home"))
+        except (KeyError, IndexError, TypeError, ValueError):
+            continue
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--date", default=None)

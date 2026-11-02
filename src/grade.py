@@ -8,7 +8,7 @@ import re
 import pandas as pd
 from nba_api.stats.static import teams as static_teams
 from nba_api.stats.endpoints import LeagueGameLog
-from src.today import load_slate, fetch_espn_events, nba_abbrev
+from src.today import load_slate, espn_finals, nba_abbrev
 from src.config import now
 
 ID_TO_ABBREV = {t["id"]: t["abbreviation"] for t in static_teams.get_teams()}
@@ -66,28 +66,17 @@ def actuals_for_date(date):
     return team, players, pair_to_gid
 
 
-def espn_finals(date):
-    """Fallback when NBA Stats is unreachable: {(away, home): (away_pts, home_pts)} for Final games."""
-    out = {}
-    for e in fetch_espn_events(date):
-        try:
-            if e["status"]["type"]["description"] != "Final":
-                continue
-            comp = e["competitions"][0]
-            abbrs = {c["homeAway"]: nba_abbrev(c["team"]["abbreviation"]) for c in comp["competitors"]}
-            scores = {c["homeAway"]: int(c.get("score", 0)) for c in comp["competitors"]}
-            out[(abbrs.get("away"), abbrs.get("home"))] = (scores.get("away"), scores.get("home"))
-        except (KeyError, IndexError, TypeError, ValueError):
-            continue
-    return out
-
-
 def grade(date=None):
-    """Returns dict with game_rows, player_rows, aggregates. None if no saved slate."""
+    """Grade a date. Prefers a saved pre-game slate; otherwise runs a point-in-time
+    backtest on the spot, so no saved data is ever required."""
     date = pd.to_datetime(date).strftime("%Y-%m-%d") if date else now().strftime("%Y-%m-%d")
     slate = load_slate(date)
     if slate is None:
-        return None
+        from src.backtest import backtest
+        res = backtest(date, verbose=False)
+        res["note"] = ((res.get("note") + " " if res.get("note") else "") +
+                       "No saved slate — predictions were reconstructed point-in-time for grading.")
+        return res
     note = None
     try:
         team_act, player_act, pair_to_gid = actuals_for_date(date)

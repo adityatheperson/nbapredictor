@@ -376,7 +376,8 @@ with tab_match:
 # ---------- Results ----------
 with tab_results:
     section("Predictions vs results",
-            "Saved slates are graded against final box scores. Pick a date to see how the model did.")
+            "Grade any date. Saved pre-game slates are used when they exist; otherwise the games "
+            "are re-predicted point-in-time on the spot (takes a few minutes, no saved data needed).")
     r1, r2 = st.columns([2, 1])
     with r1:
         grade_date = st.date_input("Game date", value=(now() - pd.Timedelta(days=1)).date())
