@@ -17,7 +17,7 @@ def fetch_range(date_from, date_to, team_abbrev):
     )
     return log.get_data_frames()[0]
 
-def upsert(path, new_df, keys=("GAME_ID", "PLAYER_ID" if "PLAYER_ID" in str(path) else "TEAM_ID")):
+def upsert(path, new_df, keys):
     keys = list(keys)
     if path.exists():
         old = pd.read_parquet(path)

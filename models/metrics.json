@@ -1,8 +1,8 @@
 {
-  "player_pts_mae": 4.523,
-  "n_train": 1110448,
-  "n_test": 195960,
-  "cutoff": "2019-03-22",
+  "player_pts_mae": 4.524,
+  "n_train": 1110786,
+  "n_test": 195811,
+  "cutoff": "2019-03-24",
   "n_features": 194,
-  "trained_at": "2026-10-31T23:42:43"
+  "trained_at": "2026-11-01T16:14:38"
 }
