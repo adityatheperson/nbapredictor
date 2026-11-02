@@ -362,12 +362,13 @@ with tab_match:
                 with col:
                     st.markdown(f"{logo(t, 28)} **{t}** · model total {out['totals'][t]:.1f}",
                                 unsafe_allow_html=True)
-                    d = out["players"][t].head(12)[["player", "pred_pts", "sigma", "base_avg10", "status"]].copy()
+                    d = out["players"][t].head(12)[["player", "pred_pts", "pred_min", "sigma", "base_avg10", "status"]].copy()
                     st.dataframe(
                         d, hide_index=True, width="stretch",
                         column_config={
                             "player": st.column_config.TextColumn("Player"),
                             "pred_pts": st.column_config.NumberColumn("Predicted pts", format="%.1f"),
+                            "pred_min": st.column_config.NumberColumn("Pred min", format="%.1f"),
                             "sigma": st.column_config.NumberColumn("Uncertainty (±)", format="%.1f"),
                             "base_avg10": st.column_config.NumberColumn("Last 10 avg", format="%.1f"),
                             "status": st.column_config.TextColumn("Status"),

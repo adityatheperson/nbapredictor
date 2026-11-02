@@ -248,6 +248,11 @@ def predict_matchup(team_a, team_b, home_team=None, game_date=None, rosters=None
         rosters = resolve_rosters(team_a, team_b)
 
     model, features, has_model = load_model()
+    try:
+        _mb = pickle.load(open("models/player_min_lgbm.pkl", "rb"))
+        min_model, min_features = _mb["model"], _mb["features"]
+    except Exception:
+        min_model, min_features = None, None
 
     results = {}
     for team, opp in [(team_a, team_b), (team_b, team_a)]:
@@ -267,14 +272,25 @@ def predict_matchup(team_a, team_b, home_team=None, game_date=None, rosters=None
                 sigma = float(x.get("PTS_STD10", 5.0) or 5.0)
                 sigma = min(max(sigma, 4.0), 12.0)
                 base_avg = float(x.get("PTS_AVG10", pts) or pts)
+                pred_min, min_scale = None, 1.0
+                if min_model is not None:
+                    Xm = pd.DataFrame([{f: x.get(f, np.nan) for f in min_features}]).fillna(-1)
+                    pred_min = float(max(0.0, min_model.predict(Xm)[0]))
+                    # NOTE 2026-11-02: scaling PTS by pred/typical minutes was tested on
+                    # 3 backtest nights and made things worse (4.93 vs ~4.6 MAE) — the
+                    # minutes predictions are noisier than the scoring ones, and the
+                    # constant-per-minute assumption doesn't hold. pred_min is kept
+                    # for display only; scoring is NOT scaled.
             else:
                 g = _player_history(pid, hist) if hist is not None else None
                 pts = float(g.tail(10)["PTS"].mean()) if g is not None and len(g) else 8.0
                 sigma = float(g.tail(10)["PTS"].std()) if g is not None and len(g) > 1 else 6.0
                 sigma = min(max(sigma or 6.0, 4.0), 12.0)
                 base_avg = pts
+                pred_min, min_scale = None, 1.0
             preds.append({"player": pname, "player_id": pid, "pred_pts": pts,
-                          "sigma": sigma, "base_avg10": base_avg})
+                          "sigma": sigma, "base_avg10": base_avg,
+                          "pred_min": round(pred_min, 1) if pred_min is not None else None})
         pdf = pd.DataFrame(preds).sort_values("pred_pts", ascending=False).reset_index(drop=True)
         # --- apply injuries: scratch OUTs, discount QUESTIONABLEs, redistribute ---
         roster_names = pdf["player"].tolist()
