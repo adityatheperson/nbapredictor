@@ -14,6 +14,7 @@ import pandas as pd
 
 from src.features_rolling import ROLL_COLS, WINDOWS
 from src.injuries import team_injuries, match_out_players, fetch_report
+from src.team_model import team_total_for
 from src.config import now
 
 APP_DIR = Path("data/app")
@@ -294,6 +295,32 @@ def predict_matchup(team_a, team_b, home_team=None, game_date=None, rosters=None
                          "out": sorted(out_names), "questionable": sorted(q_names),
                          "removed_pts": removed_pts}
 
+    # --- blend player-sum total with the team-context model (pace, opponent D, rest) ---
+    for team, opp in [(team_a, team_b), (team_b, team_a)]:
+        r = results[team]
+        rest, b2b = 2, 0
+        if hist is not None and "TEAM_ABBREVIATION" in hist.columns:
+            past_dates = hist[hist["TEAM_ABBREVIATION"] == team]["GAME_DATE"]
+            if len(past_dates):
+                gd = pd.to_datetime(game_date)
+                gd = gd.tz_localize(None) if getattr(gd, "tzinfo", None) else gd
+                rest = int(max(0, (gd - past_dates.max()).days - 1))
+                rest = int(min(rest, 14))
+                b2b = int(rest == 0)
+        try:
+            tm = team_total_for(team, opp, game_date, r["is_home"], rest, b2b)
+        except Exception:
+            tm = None
+        if tm is None:
+            blended, tm_shown = r["total"], None
+        else:
+            tm_adj = tm + redist_share * r["removed_pts"]
+            blended = 0.5 * r["total"] + 0.5 * tm_adj
+            tm_shown = round(tm_adj, 1)
+        r["playersum_total"] = round(r["total"], 1)
+        r["teammodel_total"] = tm_shown
+        r["total"] = float(blended)
+
     ta, tb = results[team_a]["total"], results[team_b]["total"]
     diff = ta - tb
     # analytic win prob (normal diff) + Monte Carlo with player variance
@@ -306,7 +333,12 @@ def predict_matchup(team_a, team_b, home_team=None, game_date=None, rosters=None
         sims = np.zeros(N_SIMS)
         for _, pr in avail.iterrows():
             sims += np.maximum(0, rng.normal(pr["pred_pts"], pr["sigma"], N_SIMS))
-        arr[:] = sims / BENCH_CORRECTION + redist_share * results[team]["removed_pts"]
+        sims = sims / BENCH_CORRECTION + redist_share * results[team]["removed_pts"]
+        # recenter sims on the blended total (keeps player-driven variance, fixes the mean)
+        base = sims.mean()
+        if base > 0:
+            sims = sims * (results[team]["total"] / base)
+        arr[:] = sims
     p_a_mc = float((sim_a > sim_b).mean())
     winner = team_a if p_a_mc >= 0.5 else team_b
     return {
@@ -319,6 +351,8 @@ def predict_matchup(team_a, team_b, home_team=None, game_date=None, rosters=None
         "winner": winner,
         "sim_totals": {team_a: sim_a, team_b: sim_b},
         "players": {team_a: results[team_a]["players"], team_b: results[team_b]["players"]},
+        "blend": {t: {"playersum": results[t]["playersum_total"],
+                      "teammodel": results[t]["teammodel_total"]} for t in (team_a, team_b)},
         "out": {team_a: results[team_a]["out"], team_b: results[team_b]["out"]},
         "questionable": {team_a: results[team_a]["questionable"], team_b: results[team_b]["questionable"]},
         "used_model": has_model,

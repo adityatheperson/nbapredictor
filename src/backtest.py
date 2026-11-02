@@ -119,16 +119,23 @@ def load_sources():
     return {"logs": recent, "mode": "snapshot", "bios_path": APP_DIR / "player_bios.parquet"}
 
 
-def backtest(date, manual_out=None, verbose=True):
+def backtest(date, manual_out=None, verbose=True, logs=None):
     from src.today import get_todays_games, espn_finals
     date = pd.to_datetime(date).normalize()
-    src = load_sources()
-    logs, mode = src["logs"], src["mode"]
+    if logs is None:
+        src = load_sources()
+        logs, mode = src["logs"], src["mode"]
+        bios_path = src["bios_path"]
+    else:
+        logs = logs
+        mode = "full"
+        from src.config import BIOS_FILE
+        bios_path = BIOS_FILE if BIOS_FILE.exists() else APP_DIR / "player_bios.parquet"
     hist = logs[logs["GAME_DATE"] < date].copy()
     if not len(hist):
         raise ValueError("No history before that date.")
 
-    bios = pd.read_parquet(src["bios_path"]).drop_duplicates("PERSON_ID")
+    bios = pd.read_parquet(bios_path).drop_duplicates("PERSON_ID")
     sy = season_year(date)
     bio_exp = pd.to_numeric(bios.get("FROM_YEAR"), errors="coerce")
     bios = bios.copy()
@@ -209,6 +216,9 @@ def backtest(date, manual_out=None, verbose=True):
     games_df = pd.DataFrame(game_rows)
     players_df = pd.DataFrame(player_rows)
     agg = {}
+    if not len(games_df):
+        return {"date": str(date.date()), "games": games_df, "players": players_df,
+                "agg": agg, "note": note}
     if len(players_df):
         ok = players_df[players_df["Status"] != "OUT"]
         agg["player_pts_mae"] = round(float(players_df["Err"].mean()), 2)
@@ -233,11 +243,52 @@ def parse_manual(s):
     return out
 
 
+def backtest_range(start, end, out_csv="data/processed/backtest_history.csv"):
+    """Run backtest for every date in [start, end], aggregate with CIs. Slow; run in background."""
+    import math
+    from src.config import TRAINING_FILE
+    logs = pd.read_parquet(TRAINING_FILE)
+    logs["GAME_DATE"] = pd.to_datetime(logs["GAME_DATE"]).dt.normalize()
+    rows = []
+    for d in pd.date_range(start, end, freq="D"):
+        try:
+            res = backtest(d, verbose=False, logs=logs)
+        except Exception as e:
+            print(f"{d.date()}: FAILED {str(e)[:120]}")
+            continue
+        a = res["agg"]
+        acc = None
+        m = re.match(r"(\d+)% \((\d+)/(\d+)\)", a.get("winner_accuracy", ""))
+        if m:
+            acc = (int(m.group(2)), int(m.group(3)))
+        rows.append({"date": str(d.date()), "n_games": len(res["games"]),
+                     "wins": acc[0] if acc else 0, "finals": acc[1] if acc else 0,
+                     "team_mae": a.get("team_total_mae"), "player_mae": a.get("player_pts_mae")})
+        print(f"{d.date()}: {len(res['games'])} games, acc={a.get('winner_accuracy')}, "
+              f"team_mae={a.get('team_total_mae')}, player_mae={a.get('player_pts_mae')}", flush=True)
+    df = pd.DataFrame(rows)
+    df.to_csv(out_csv, index=False)
+    w, n = int(df["wins"].sum()), int(df["finals"].sum())
+    phat = w / n if n else 0
+    se = math.sqrt(phat * (1 - phat) / n) if n else 0
+    print(f"TOTAL: {w}/{n} winners = {phat * 100:.1f}% ± {1.96 * se * 100:.1f}pp (95% CI)")
+    print(f"team MAE: {df['team_mae'].mean():.2f} | player MAE: {df['player_mae'].mean():.2f}")
+    print(f"saved -> {out_csv}")
+    return df
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--date", required=True)
+    ap.add_argument("--date", default=None)
+    ap.add_argument("--from", dest="start", default=None)
+    ap.add_argument("--to", dest="end", default=None)
     ap.add_argument("--out", default="", help='"BOS:Tatum;Brown,LAL:Doncic" known outs to scratch')
     args = ap.parse_args()
+    if args.start and args.end:
+        backtest_range(args.start, args.end)
+        return
+    if not args.date:
+        ap.error("--date or --from/--to required")
     res = backtest(args.date, parse_manual(args.out))
     print(res["games"].to_string(index=False))
     print("agg:", res["agg"])
